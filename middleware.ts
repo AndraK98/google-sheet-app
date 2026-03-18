@@ -12,6 +12,12 @@ function unauthorizedResponse() {
   });
 }
 
+function misconfiguredResponse() {
+  return new NextResponse("Basic auth is not configured.", {
+    status: 503,
+  });
+}
+
 function parseBasicAuth(header: string) {
   const [scheme, value] = header.split(" ");
 
@@ -47,8 +53,13 @@ async function createAuthToken(user: string, password: string) {
 export async function middleware(request: NextRequest) {
   const configuredUser = process.env.BASIC_AUTH_USER?.trim();
   const configuredPassword = process.env.BASIC_AUTH_PASSWORD?.trim();
+  const isProtectedDeployment = process.env.VERCEL === "1" || process.env.NODE_ENV === "production";
 
   if (!configuredUser || !configuredPassword) {
+    if (isProtectedDeployment) {
+      return misconfiguredResponse();
+    }
+
     return NextResponse.next();
   }
 
