@@ -211,6 +211,7 @@ function MediaPreview({ src, alt }: { src: string; alt: string }) {
 
   return (
     <figure className="valuation-preview">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src={src} alt={alt} onError={() => setHidden(true)} />
     </figure>
   );

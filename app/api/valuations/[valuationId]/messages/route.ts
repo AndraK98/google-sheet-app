@@ -27,15 +27,15 @@ function buildAssistantMessageContent(record: Pick<ValuationRecord, "pricing_sum
 export async function POST(
   request: NextRequest,
   context: {
-    params: {
+    params: Promise<{
       valuationId: string;
-    };
+    }>;
   },
 ) {
   try {
     const repository = getRepository();
     const config = getAppConfig();
-    const { valuationId } = context.params;
+    const { valuationId } = await context.params;
     const valuation = await repository.findValuationById(valuationId);
 
     if (!valuation) {
