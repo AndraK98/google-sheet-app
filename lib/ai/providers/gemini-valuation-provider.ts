@@ -180,8 +180,53 @@ function inferCaratFromText(description: string) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+function tokenizeDescription(description: string) {
+  return Array.from(
+    new Set(
+      description
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 3),
+    ),
+  );
+}
+
+function hasStoneIntent(description: string) {
+  return /\b(stone|diamond|sapphire|ruby|emerald|moissanite|opal|garnet|topaz|tourmaline|amethyst|aquamarine|morganite|spinel|onyx|pearl|gem|gems|carat|carats|lab diamond|lab dia)\b/i.test(
+    description,
+  );
+}
+
+function buildWeightedTokens(description: string) {
+  const genericTokens = new Set([
+    "ring",
+    "gold",
+    "size",
+    "pure",
+    "yellow",
+    "white",
+    "rose",
+    "metal",
+    "piece",
+    "with",
+    "for",
+    "and",
+    "the",
+    "this",
+  ]);
+
+  return tokenizeDescription(description).map((token) => ({
+    token,
+    weight: genericTokens.has(token) ? 1 : 4,
+  }));
+}
+
 function inferComplexityFromText(description: string) {
   const normalized = description.toLowerCase();
+
+  if (/\bsignet\b/.test(normalized)) {
+    return 1;
+  }
 
   if (/\b(plain|simple|minimal|solitaire|band)\b/.test(normalized)) {
     return 1;
@@ -220,6 +265,39 @@ function resolveMetalRate(metal: string, context: ValuationCatalogContext) {
   return context.defaults.metalPrices.gold;
 }
 
+function findBestCatalogMatch<T>(
+  items: T[],
+  haystackBuilder: (item: T) => string,
+  description: string,
+): T | undefined {
+  const weightedTokens = buildWeightedTokens(description);
+
+  if (!weightedTokens.length) {
+    return undefined;
+  }
+
+  let bestScore = 0;
+  let bestItem: T | undefined;
+
+  for (const item of items) {
+    const haystack = haystackBuilder(item).toLowerCase();
+    let score = 0;
+
+    for (const { token, weight } of weightedTokens) {
+      if (haystack.includes(token)) {
+        score += weight;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestItem = item;
+    }
+  }
+
+  return bestScore >= 4 ? bestItem : undefined;
+}
+
 function fallbackMatchedStone(context: ValuationCatalogContext, description: string, parsed: unknown) {
   const source = parsed as Record<string, unknown>;
   const matchedStoneId = normalizeTextValue(source.matched_catalog_stone_id);
@@ -231,11 +309,15 @@ function fallbackMatchedStone(context: ValuationCatalogContext, description: str
     }
   }
 
-  return takeMatchingOrFallback(
+  if (!hasStoneIntent(description)) {
+    return undefined;
+  }
+
+  return findBestCatalogMatch(
     context.stones,
-    (stone) => matchesDescription(`${stone.stone_id} ${stone.name} ${stone.shape} ${stone.color} ${stone.quality}`, description),
-    1,
-  )[0];
+    (stone) => `${stone.stone_id} ${stone.name} ${stone.shape} ${stone.color} ${stone.quality}`,
+    description,
+  );
 }
 
 function fallbackMatchedSetting(context: ValuationCatalogContext, description: string, parsed: unknown) {
@@ -251,11 +333,11 @@ function fallbackMatchedSetting(context: ValuationCatalogContext, description: s
     }
   }
 
-  return takeMatchingOrFallback(
+  return findBestCatalogMatch(
     context.settings,
-    (setting) => matchesDescription(`${setting.setting_id} ${setting.style} ${setting.metal}`, description),
-    1,
-  )[0];
+    (setting) => `${setting.setting_id} ${setting.style} ${setting.metal} ${setting.dimensions_mm} ${setting.stone_capacity}`,
+    description,
+  );
 }
 
 function estimateFromContext(
@@ -265,24 +347,29 @@ function estimateFromContext(
   matchedStone: Stone | undefined,
   matchedSetting: Setting | undefined,
 ): ValuationEstimate {
+  const descriptionHasStone = hasStoneIntent(input.description);
   const inferredMetal = normalizeTextValue(partial.inferred_metal) || inferMetalFromText(input.description) || matchedSetting?.metal || "";
   const inferredWeight =
     normalizeNumericValue(partial.inferred_gold_weight_g) || inferWeightFromText(input.description) || matchedSetting?.gold_weight_g || 0;
   const inferredCarat =
-    normalizeNumericValue(partial.inferred_carat) || inferCaratFromText(input.description) || matchedStone?.carat || 0;
+    descriptionHasStone
+      ? normalizeNumericValue(partial.inferred_carat) || inferCaratFromText(input.description) || matchedStone?.carat || 0
+      : 0;
   const inferredComplexity =
     clampComplexity(
-      normalizeNumericValue(partial.inferred_complexity_level) ||
+      matchedSetting?.complexity_level ||
+        normalizeNumericValue(partial.inferred_complexity_level) ||
         inferComplexityFromText(input.description) ||
-        matchedSetting?.complexity_level ||
         0,
     ) || 3;
-  const stoneBase = matchedStone?.final_price ?? 0;
+  const stoneBase = descriptionHasStone ? matchedStone?.final_price ?? 0 : 0;
   const settingBase = matchedSetting?.base_price ?? 0;
   const laborBase = matchedSetting?.labor_cost ?? (inferredComplexity > 0 ? inferredComplexity * 40 : 0);
   const metalRate = resolveMetalRate(inferredMetal || matchedSetting?.metal || "gold", context);
   const materialBase = inferredWeight > 0 ? inferredWeight * metalRate : 0;
-  const stoneTotal = roundMoney(normalizeNumericValue(partial.estimated_stone_total) || stoneBase);
+  const stoneTotal = descriptionHasStone
+    ? roundMoney(normalizeNumericValue(partial.estimated_stone_total) || stoneBase)
+    : 0;
   let settingTotal = roundMoney(normalizeNumericValue(partial.estimated_setting_total) || settingBase);
 
   if (settingTotal <= 0) {
@@ -305,9 +392,9 @@ function estimateFromContext(
           low: 0,
           high: 0,
         };
-  const pricingSummary = normalizeTextValue(partial.pricing_summary);
   const reasoning = normalizeTextValue(partial.reasoning);
   const recommendedNextStep = normalizeTextValue(partial.recommended_next_step);
+  const canonicalPricingSummary = `Stone subtotal ${roundMoney(stoneTotal)} USD. Setting subtotal ${roundMoney(settingTotal)} USD. Complexity ${inferredComplexity} uses ${complexityMultiplier}x. Formula total ${roundMoney(formulaTotal)} USD.`;
 
   return {
     ...partial,
@@ -317,15 +404,15 @@ function estimateFromContext(
     estimated_setting_total: settingTotal,
     inferred_complexity_multiplier: complexityMultiplier,
     estimated_formula_total: formulaTotal,
-    pricing_summary:
-      pricingSummary ||
-      `Stone subtotal ${roundMoney(stoneTotal)} USD. Setting subtotal ${roundMoney(settingTotal)} USD. Complexity ${inferredComplexity} uses ${complexityMultiplier}x. Formula total ${roundMoney(formulaTotal)} USD.`,
+    pricing_summary: canonicalPricingSummary,
     reasoning:
       reasoning ||
       "Gemini output was normalized against catalog anchors, metal rates, inferred weight, and the internal complexity grid before the final formula was applied.",
     recommended_next_step:
       recommendedNextStep || "Review the inferred weight and nearest catalog match before sending the quote.",
-    matched_catalog_stone_id: normalizeTextValue(partial.matched_catalog_stone_id, matchedStone?.stone_id ?? ""),
+    matched_catalog_stone_id: descriptionHasStone
+      ? normalizeTextValue(partial.matched_catalog_stone_id, matchedStone?.stone_id ?? "")
+      : "",
     matched_catalog_setting_id: normalizeTextValue(partial.matched_catalog_setting_id, matchedSetting?.setting_id ?? ""),
     inferred_metal: inferredMetal,
     inferred_carat: inferredCarat,
@@ -399,11 +486,7 @@ function buildConversationTranscript(history: ValuationMessage[]) {
 
 function matchesDescription(haystack: string, description: string) {
   const normalizedHaystack = haystack.toLowerCase();
-  const tokens = description
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length >= 3)
-    .slice(0, 24);
+  const tokens = tokenizeDescription(description).slice(0, 24);
 
   if (!tokens.length) {
     return true;
@@ -431,11 +514,15 @@ export class GeminiValuationProvider implements ValuationProvider {
     options?: { history?: ValuationMessage[] },
   ): Promise<ValuationEstimate> {
     const metalRates = context.defaults.metalPrices;
+    const descriptionHasStone = hasStoneIntent(input.description);
 
-    const stoneCatalogExcerpt = takeMatchingOrFallback(
-      context.stones,
-      (stone) => matchesDescription(`${stone.name} ${stone.shape} ${stone.color} ${stone.quality}`, input.description),
-      8,
+    const stoneCatalogExcerpt = (descriptionHasStone
+      ? takeMatchingOrFallback(
+          context.stones,
+          (stone) => matchesDescription(`${stone.name} ${stone.shape} ${stone.color} ${stone.quality}`, input.description),
+          8,
+        )
+      : []
     )
       .map((stone) => ({
         stone_id: stone.stone_id,
@@ -490,6 +577,8 @@ export class GeminiValuationProvider implements ValuationProvider {
       "If a characteristic cannot be inferred, return an empty string for text fields and 0 for numeric fields.",
       "All numeric fields must be raw JSON numbers only. Do not include units, currency symbols, words, or formatted strings in numeric fields.",
       "Do not use null, NaN, unknown, or explanatory text in numeric fields. Always output concrete numbers for estimated_stone_total, estimated_setting_total, and inferred_complexity_level.",
+      "If no stone is described or implied, estimated_stone_total must be 0.",
+      "When a close setting style exists in the provided catalog excerpt, prefer that setting's complexity level as the anchor. Simple signet rings should resolve to complexity level 1 unless the brief clearly describes extra intricate work.",
       "If the description gives weight or material but not a catalog match, still produce an estimate from the metal rates and a practical making/labor assumption.",
       "pricing_summary must be a concise numeric pricing trace, not hidden chain-of-thought. Keep it to 3-5 short sentences with the main amounts and basis used, including stone subtotal, setting subtotal, complexity, multiplier, and formula total.",
       "reasoning must stay short.",
